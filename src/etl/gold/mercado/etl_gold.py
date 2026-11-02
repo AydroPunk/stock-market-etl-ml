@@ -21,8 +21,8 @@ import sys
 from pyspark.sql import DataFrame, Window, functions as F
 
 from src.etl.shared.precios_fx import (
-    BARRAS_DIA, DB_PATH, FX, INTRADAY, MARKET, MAX_DIAS_FX, ROOT, columnas, construir_db,
-    crear_spark, escribir_diccionario, guardar_por_ticker, leer_capa, muestra, redondear,
+    BARRAS_DIA, DB_PATH, FX, INTRADAY, MARKET, MAX_DIAS_FX, ROOT, carpeta, columnas, construir_db,
+    crear_spark, error_claro, escribir_diccionario, guardar_por_ticker, leer_capa, muestra, redondear,
 )
 
 SCRIPT = "src.etl.gold.mercado.etl_gold"
@@ -89,35 +89,58 @@ def gold_intraday_diario(barras: DataFrame) -> DataFrame:
     return redondear(df.select(*columnas("intraday/gold_diario")), "intraday/gold_diario")
 
 
+def _gold_en_disco(spark, dominio: str, capa: str, sub: str = "") -> DataFrame | None:
+    """El gold que dejó una corrida anterior, o None si todavía no existe."""
+    if not any((carpeta(dominio, "gold") / sub).glob("*.csv")):
+        return None
+    return leer_capa(spark, dominio, "gold", capa, sub)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Capa gold de Precios & FX con PySpark")
     parser.add_argument("--solo", choices=("market", "intraday"))
     args = parser.parse_args(argv)
-    spark = crear_spark("gold_mercado")
+    spark = None
     try:
+        spark = crear_spark("gold_mercado")
         mkt = diario = None
         if args.solo in (None, "market"):
             mkt = gold_market(leer_capa(spark, "market", "silver", "market/silver")).cache()
-            n = guardar_por_ticker(mkt, MARKET / "gold", ["fecha"])
+            n = guardar_por_ticker(mkt, "market/gold", MARKET / "gold", ["fecha"])
             escribir_diccionario("market/gold", muestra(mkt, "fecha"), n, SCRIPT)
             print(f"  gold market: {n} símbolos, {mkt.count():,} filas")
         if args.solo in (None, "intraday"):
             barras = gold_intraday(leer_capa(spark, "intraday", "silver", "intraday/silver")).cache()
             diario = gold_intraday_diario(barras).cache()
-            n = guardar_por_ticker(barras, INTRADAY / "gold", ["fecha_hora"])
-            guardar_por_ticker(diario, INTRADAY / "gold" / "diario", ["fecha"])
+            n = guardar_por_ticker(barras, "intraday/gold", INTRADAY / "gold", ["fecha_hora"])
+            guardar_por_ticker(diario, "intraday/gold_diario", INTRADAY / "gold" / "diario", ["fecha"])
             escribir_diccionario(
                 "intraday/gold", muestra(barras, "fecha_hora", ticker="WALMEX"), n, SCRIPT,
                 extra=("intraday/gold_diario", muestra(diario, "fecha", ticker="WALMEX"), "diario/"),
             )
             print(f"  gold intraday: {n} emisoras, {barras.count():,} barras, {diario.count():,} días")
-        if mkt is not None:
+        # La base siempre lleva sus tres tablas: lo que no se recalculó en esta corrida
+        # (por --solo) se toma del gold que ya está en disco.
+        if mkt is None:
+            mkt = _gold_en_disco(spark, "market", "market/gold")
+        if diario is None:
+            diario = _gold_en_disco(spark, "intraday", "intraday/gold_diario", "diario")
+        if mkt is None:
+            print("  ! la base del agente no se actualizó: falta data/market/gold (corre gold sin --solo)")
+        else:
+            if diario is None:
+                print("  ! la base queda sin intradía: falta data/intraday/gold/diario")
             # La base se arma con pandas: SQLite no se escribe desde Spark sin un driver JDBC.
-            diario_pd = diario.toPandas() if diario is not None else None
-            construir_db(mkt.toPandas(), diario_pd)
+            construir_db(mkt.toPandas(), diario.toPandas() if diario is not None else None)
             print(f"  base del agente: {DB_PATH.relative_to(ROOT)}")
+    except Exception as e:
+        if (msg := error_claro(e)) is None:
+            raise
+        print(f"\n  ✗ {msg}", file=sys.stderr)
+        return 1
     finally:
-        spark.stop()
+        if spark is not None:
+            spark.stop()
     return 0
 
 

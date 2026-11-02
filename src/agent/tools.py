@@ -337,9 +337,11 @@ class AgenteMercadoSQL(ObservationAgent):
         if not isinstance(arbol, (exp.Select, exp.Union)):
             raise ValueError("Solo se permiten consultas SELECT.")
 
-        ctes = {cte.alias for cte in arbol.find_all(exp.CTE)}
+        # SQLite no distingue mayúsculas en los nombres de tabla: PRECIOS_HISTORICOS también vale.
+        ctes = {cte.alias.lower() for cte in arbol.find_all(exp.CTE)}
         for tabla in arbol.find_all(exp.Table):
-            if tabla.name not in TABLAS_MERCADO and tabla.name not in ctes:
+            nombre = tabla.name.lower()
+            if nombre not in TABLAS_MERCADO and nombre not in ctes:
                 raise ValueError(f"Acceso denegado a la tabla: {tabla.name}")
 
     def observe(self, sql_query: str = "", **params) -> dict:
@@ -373,7 +375,8 @@ class AgenteMercadoSQL(ObservationAgent):
                         "error": f"La consulta excedió {self.timeout_s:g} s."}
             return {"ok": False, "error_tipo": "error_db", "error": f"Error en DB: {e}"}
 
-        datos = df.to_dict(orient="records")
+        # Un NULL de SQLite llega a pandas como NaN, que no es JSON válido: se manda como None (null).
+        datos = df.astype(object).where(df.notna(), None).to_dict(orient="records")
         return {
             "ok": True,
             "query_ejecutada": sql_query,

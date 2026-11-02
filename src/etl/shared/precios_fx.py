@@ -6,8 +6,11 @@ ticker, el diccionario de datos y la base SQLite del agente.
 """
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import sqlite3
+import subprocess
 import warnings
 from pathlib import Path
 from urllib.parse import unquote
@@ -25,6 +28,11 @@ MAX_DIAS_FX = 5  # si falta el tipo de cambio, el último conocido hasta 5 días
 BARRAS_DIA = 79  # 6.5 h de sesión / 5 min + 1
 UMBRAL_FALLA = 0.8  # % de emisoras con un solo precio el mismo día = falla de la fuente
 DECIMALES = 10
+
+
+class ErrorETL(Exception):
+    """Error con un mensaje claro para quien corre el ETL; se muestra sin la traza de Java."""
+
 
 # ── esquemas: una sola fuente de verdad para Spark, CSV, diccionario y SQLite ─
 
@@ -138,9 +146,39 @@ def esquema_spark(capa: str):
 
 # ── Spark ────────────────────────────────────────────────────────────────────
 
+JAVA_MINIMO = 17
+INSTALAR_JAVA = "en Fedora: sudo dnf install java-21-openjdk-headless"
+
+
+def _revisar_java() -> None:
+    """PySpark necesita Java 17 o más reciente; sin él, Spark falla con un error difícil de leer."""
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        java = Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")
+        if not java.exists():
+            raise ErrorETL(f"JAVA_HOME apunta a {java_home}, pero ahí no está Java. "
+                           "Corrige la ruta o quita esa variable.")
+    else:
+        encontrado = shutil.which("java")
+        if encontrado is None:
+            raise ErrorETL(f"Falta Java. PySpark necesita Java {JAVA_MINIMO} o más reciente ({INSTALAR_JAVA}).")
+        java = Path(encontrado)
+    try:
+        salida = subprocess.run([str(java), "-version"], capture_output=True, text=True, timeout=30).stderr
+    except (OSError, subprocess.TimeoutExpired):
+        return  # si no se puede preguntar la versión, que Spark lo intente
+    m = re.search(r'version "(\d+)(?:\.(\d+))?', salida)
+    if m:
+        mayor = int(m.group(2) if m.group(1) == "1" and m.group(2) else m.group(1))  # "1.8" es Java 8
+        if mayor < JAVA_MINIMO:
+            raise ErrorETL(f"Tienes Java {mayor} y PySpark necesita Java {JAVA_MINIMO} o más reciente "
+                           f"({INSTALAR_JAVA}).")
+
+
 def crear_spark(nombre: str):
     from pyspark.sql import SparkSession
 
+    _revisar_java()
     # PySpark avisa que no está probado con pandas >= 3. Aquí pandas solo arma la
     # base SQLite y las muestras del diccionario, y los resultados se validaron:
     # se silencia solo ese aviso para que se lea la salida del ETL.
@@ -161,7 +199,9 @@ def crear_spark(nombre: str):
         .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true")
         .getOrCreate()
     )
-    spark.sparkContext.setLogLevel("ERROR")
+    # Solo errores fatales en el log: un error conocido se explica en una línea (error_claro) y
+    # uno desconocido llega a Python con toda la traza de Java, así que no se pierde nada.
+    spark.sparkContext.setLogLevel("FATAL")
     return spark
 
 
@@ -170,11 +210,18 @@ def carpeta(dominio: str, nivel: str) -> Path:
 
 
 def leer_capa(spark, dominio: str, nivel: str, capa: str, sub: str = ""):
-    """Lee los CSV de una capa con su esquema. Silver lee bronze y gold lee silver."""
+    """Lee los CSV de una capa con su esquema. Silver lee bronze y gold lee silver.
+
+    Lectura estricta: Spark compara el encabezado de cada CSV con el esquema
+    (enforceSchema=False) y se detiene si no coincide; sin esto lee por posición
+    y puede meter el cierre en la columna de apertura sin avisar. Con FAILFAST,
+    un valor que no es del tipo esperado detiene la lectura en vez de quedar vacío.
+    """
     origen = carpeta(dominio, nivel) / sub
     if not any(origen.glob("*.csv")):
-        raise FileNotFoundError(f"No hay CSV en {origen.relative_to(ROOT)}. Corre antes la capa anterior.")
-    return spark.read.csv(str(origen / "*.csv"), header=True, schema=esquema_spark(capa))
+        raise ErrorETL(f"No hay CSV en {origen.relative_to(ROOT)}. Corre antes la capa anterior.")
+    return spark.read.csv(str(origen / "*.csv"), header=True, schema=esquema_spark(capa),
+                          enforceSchema=False, mode="FAILFAST")
 
 
 def redondear(df, capa: str):
@@ -187,17 +234,51 @@ def redondear(df, capa: str):
     return df
 
 
-def guardar_por_ticker(df, destino: Path, orden: list[str]) -> int:
+FORMATO_FECHA = {
+    "fecha": r"^\d{4}-\d{2}-\d{2}$",
+    "fecha y hora": r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+}
+
+
+def validar(df, capa: str) -> None:
+    """Revisa una capa antes de escribirla; si algo falla, lo que ya había en disco no se toca.
+
+    Columnas iguales al esquema, al menos una fila, ticker siempre lleno y
+    fechas con formato AAAA-MM-DD (más HH:MM:SS en las de fecha y hora).
+    """
+    from pyspark.sql import functions as F
+
+    if df.columns != columnas(capa):
+        raise ErrorETL(f"{capa}: las columnas {df.columns} no coinciden con el esquema {columnas(capa)}.")
+    malas = {"ticker": F.col("ticker").isNull() | (F.trim("ticker") == "")}
+    for c, t, _ in ESQUEMA[capa]:
+        if t in FORMATO_FECHA:
+            malas[c] = F.col(c).isNull() | ~F.col(c).rlike(FORMATO_FECHA[t])
+    r = df.agg(F.count("*").alias("_filas"),
+               *[F.sum(cond.cast("int")).alias(c) for c, cond in malas.items()]).first()
+    problemas = ([] if r["_filas"] else ["no tiene filas"])
+    problemas += [f"{r[c]:,} fila{'s' if r[c] > 1 else ''} con el campo {c} vacío o mal escrito"
+                  for c in malas if r[c]]
+    if problemas:
+        raise ErrorETL(f"{capa} no pasó la revisión: {'; '.join(problemas)}. "
+                       "No se escribió nada y los CSV anteriores siguen igual.")
+
+
+def guardar_por_ticker(df, capa: str, destino: Path, orden: list[str]) -> int:
     """Escribe un CSV por ticker (destino/<TICKER>.csv), igual que un parquet por ticker.
 
-    Spark escribe en carpetas part-*.csv; aquí se juntan y se renombran.
+    Primero valida la capa. Spark escribe carpetas part-*.csv en _spark_tmp; se
+    juntan en un CSV por ticker dentro de _nuevo y solo al final reemplazan a los
+    anteriores, así un error a medio camino no deja la capa vacía ni mezclada.
     Devuelve cuántos archivos quedaron.
     """
     from pyspark.sql import functions as F
 
+    validar(df, capa)
     destino.mkdir(parents=True, exist_ok=True)
-    tmp = destino / "_spark_tmp"
+    tmp, nuevo = destino / "_spark_tmp", destino / "_nuevo"
     shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(nuevo, ignore_errors=True)
     (
         df.withColumn("_archivo", F.col("ticker"))
         .repartition("_archivo")
@@ -207,26 +288,70 @@ def guardar_por_ticker(df, destino: Path, orden: list[str]) -> int:
         .mode("overwrite")
         .csv(str(tmp))
     )
-    for viejo in destino.glob("*.csv"):
-        viejo.unlink()
-    n = 0
+    nuevo.mkdir()
     for parte in sorted(tmp.glob("_archivo=*")):
         nombre = unquote(parte.name.split("=", 1)[1])
         archivos = sorted(parte.glob("part-*.csv"))
-        with open(destino / f"{nombre}.csv", "w", encoding="utf-8") as out:
+        with open(nuevo / f"{nombre}.csv", "w", encoding="utf-8") as out:
             for i, f in enumerate(archivos):
                 lineas = f.read_text(encoding="utf-8").splitlines(keepends=True)
                 out.writelines(lineas if i == 0 else lineas[1:])
-        n += 1
+    nuevos = sorted(nuevo.glob("*.csv"))
+    if not nuevos:
+        raise ErrorETL(f"Spark no dejó archivos para {capa}. Los CSV anteriores siguen igual.")
+    # Cada CSV nuevo reemplaza al viejo de un jalón; después se borran los de tickers que ya no vienen.
+    vigentes = {f.name for f in nuevos}
+    for f in nuevos:
+        f.replace(destino / f.name)
+    for viejo in destino.glob("*.csv"):
+        if viejo.name not in vigentes:
+            viejo.unlink()
     shutil.rmtree(tmp, ignore_errors=True)
-    return n
+    shutil.rmtree(nuevo, ignore_errors=True)
+    return len(nuevos)
 
 
 def ticker_de_archivo():
-    """Saca el ticker del nombre del parquet: .../WALMEX.MX.parquet → WALMEX.MX."""
+    """Saca el ticker del nombre del parquet: .../WALMEX.MX.parquet → WALMEX.MX.
+
+    Spark entrega la ruta como dirección web (^MXX llega como %5EMXX, un espacio
+    como %20) y aquí se traduce de regreso. El + se protege antes porque
+    url_decode lo convertiría en espacio.
+    """
     from pyspark.sql import functions as F
 
-    return F.regexp_extract(F.input_file_name(), r"([^/]+)\.parquet$", 1)
+    nombre = F.regexp_extract(F.input_file_name(), r"([^/]+)\.parquet$", 1)
+    return F.url_decode(F.regexp_replace(nombre, r"\+", "%2B"))
+
+
+# ── errores con mensaje claro ────────────────────────────────────────────────
+
+def _ruta_legible(uri: str) -> str:
+    ruta = unquote(re.sub(r"^file:/*", "/", uri))
+    try:
+        return str(Path(ruta).resolve().relative_to(ROOT))
+    except (ValueError, OSError):
+        return ruta
+
+
+def error_claro(e: Exception) -> str | None:
+    """Mensaje corto para los errores conocidos; None si conviene ver la traza completa."""
+    if isinstance(e, ErrorETL):
+        return str(e)
+    texto = str(e)
+    archivo = re.search(r"(file:/\S+?\.csv)", texto)
+    ruta = _ruta_legible(archivo.group(1)) if archivo else "de esta capa"
+    if "CSV header does not conform to the schema" in texto:
+        m = re.search(r"Expected: (\S+) but found: (\S+)", texto)
+        detalle = f": se esperaba la columna {m.group(1)} y viene {m.group(2)}" if m else ""
+        return (f"El CSV {ruta} no tiene las columnas que espera esta capa{detalle}. "
+                "Vuelve a correr la capa anterior para regenerarlo.")
+    if "Malformed records are detected" in texto:
+        m = re.search(r'For input string: "([^"]*)"', texto)
+        detalle = f' ("{m.group(1)}")' if m else ""
+        return (f"El CSV {ruta} trae un valor que no es del tipo esperado{detalle}. "
+                "Vuelve a correr la capa anterior para regenerarlo.")
+    return None
 
 
 # ── diccionario de datos ─────────────────────────────────────────────────────
@@ -288,6 +413,11 @@ def construir_db(precios: pd.DataFrame, intradia_diario: pd.DataFrame | None,
     Las barras de 5 min no entran: son 1.1 millones de filas que el agente no
     necesita para responder; ML las lee de los CSV de data/intraday/gold/.
     """
+    # Se insertan ordenadas por ticker y fecha: Spark no garantiza el orden de las filas y así la
+    # base sale idéntica corra gold completo o con --solo (que lee del gold en disco).
+    precios = precios.sort_values(["ticker", "fecha"], ignore_index=True)
+    if intradia_diario is not None:
+        intradia_diario = intradia_diario.sort_values(["ticker", "fecha"], ignore_index=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = db_path.with_suffix(".tmp")
     tmp.unlink(missing_ok=True)

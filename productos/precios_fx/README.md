@@ -17,7 +17,9 @@ python productos/precios_fx/calidad_datos.py       # gráficas y CSV de calidad 
 python productos/precios_fx/demo_herramienta_sql.py   # simula lo que haría Claude, sin gastar tokens
 ```
 
-Cada capa acepta `--solo market` o `--solo intraday`. Las tres juntas tardan unos 3 minutos.
+Antes de escribir, cada capa revisa que tenga filas, que ningún ticker venga vacío y que las fechas estén bien escritas.
+Si algo falla, se detiene con un mensaje y los CSV anteriores se quedan como estaban. También se detiene si un CSV de la
+capa anterior no trae las columnas esperadas o trae un valor de otro tipo.
 
 ## Capas
 

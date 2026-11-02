@@ -21,7 +21,7 @@ import sys
 from pyspark.sql import DataFrame, Window, functions as F
 
 from src.etl.shared.precios_fx import (
-    BARRAS_DIA, FX, INTRADAY, MARKET, SALTO, UMBRAL_FALLA, columnas, crear_spark,
+    BARRAS_DIA, FX, INTRADAY, MARKET, SALTO, UMBRAL_FALLA, columnas, crear_spark, error_claro,
     escribir_diccionario, guardar_por_ticker, leer_capa, muestra,
 )
 
@@ -132,23 +132,30 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Capa silver de Precios & FX con PySpark")
     parser.add_argument("--solo", choices=("market", "intraday"))
     args = parser.parse_args(argv)
-    spark = crear_spark("silver_mercado")
+    spark = None
     try:
+        spark = crear_spark("silver_mercado")
         mkt = silver_market(leer_capa(spark, "market", "bronze", "market/bronze")).cache()
         if args.solo in (None, "market"):
-            n = guardar_por_ticker(mkt, MARKET / "silver", ["fecha"])
+            n = guardar_por_ticker(mkt, "market/silver", MARKET / "silver", ["fecha"])
             escribir_diccionario("market/silver", muestra(mkt, "fecha"), n, SCRIPT)
             print(f"  silver market: {n} símbolos, {mkt.count():,} filas")
         if args.solo in (None, "intraday"):
             dias = dias_bmv(mkt).cache()
             intra = silver_intraday(leer_capa(spark, "intraday", "bronze", "intraday/bronze"), dias).cache()
-            n = guardar_por_ticker(intra, INTRADAY / "silver", ["fecha_hora"])
+            n = guardar_por_ticker(intra, "intraday/silver", INTRADAY / "silver", ["fecha_hora"])
             escribir_diccionario("intraday/silver", muestra(intra, "fecha_hora", ticker="WALMEX"), n, SCRIPT)
             fallas = sorted(r[0] for r in intra.filter("flag_falla_fuente = 1").select("fecha").distinct().collect())
             print(f"  silver intraday: {n} emisoras, {intra.count():,} filas")
             print(f"  días hábiles con falla de la fuente: {', '.join(fallas) or 'ninguno'}")
+    except Exception as e:
+        if (msg := error_claro(e)) is None:
+            raise
+        print(f"\n  ✗ {msg}", file=sys.stderr)
+        return 1
     finally:
-        spark.stop()
+        if spark is not None:
+            spark.stop()
     return 0
 
 

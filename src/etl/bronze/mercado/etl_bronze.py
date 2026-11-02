@@ -24,7 +24,7 @@ from pyspark.sql import DataFrame, functions as F
 from pyspark.sql import types as T
 
 from src.etl.shared.precios_fx import (
-    INTRADAY, MARKET, columnas, crear_spark, escribir_diccionario,
+    INTRADAY, MARKET, ROOT, ErrorETL, columnas, crear_spark, error_claro, escribir_diccionario,
     guardar_por_ticker, muestra, redondear, ticker_de_archivo,
 )
 
@@ -56,6 +56,9 @@ def _leer_parquets(spark, carpeta: Path) -> list[DataFrame]:
             continue
         firma = str(meta.schema.to_arrow_schema().remove_metadata())
         grupos.setdefault(firma, []).append(str(path))
+    if not grupos:
+        raise ErrorETL(f"No hay archivos .parquet con datos en {carpeta.relative_to(ROOT)}. "
+                       "Revisa que el repo esté completo (git pull).")
     return [spark.read.parquet(*rutas).withColumn("ticker", ticker_de_archivo())
             for rutas in grupos.values()]
 
@@ -98,21 +101,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Capa bronze de Precios & FX con PySpark")
     parser.add_argument("--solo", choices=("market", "intraday"))
     args = parser.parse_args(argv)
-    spark = crear_spark("bronze_mercado")
+    spark = None
     try:
+        spark = crear_spark("bronze_mercado")
         if args.solo in (None, "market"):
             df = bronze_market(spark).cache()
-            n = guardar_por_ticker(df, MARKET / "bronze", ["Date"])
+            n = guardar_por_ticker(df, "market/bronze", MARKET / "bronze", ["Date"])
             escribir_diccionario("market/bronze", muestra(df, "Date", desde_inicio=True), n, SCRIPT)
             print(f"  bronze market: {n} símbolos, {df.count():,} filas")
         if args.solo in (None, "intraday"):
             df = bronze_intraday(spark).cache()
-            n = guardar_por_ticker(df, INTRADAY / "bronze", ["datetime"])
+            n = guardar_por_ticker(df, "intraday/bronze", INTRADAY / "bronze", ["datetime"])
             escribir_diccionario("intraday/bronze", muestra(df, "datetime", ticker="WALMEX", desde_inicio=True), n,
                                  SCRIPT)
             print(f"  bronze intraday: {n} emisoras, {df.count():,} filas")
+    except Exception as e:
+        if (msg := error_claro(e)) is None:
+            raise
+        print(f"\n  ✗ {msg}", file=sys.stderr)
+        return 1
     finally:
-        spark.stop()
+        if spark is not None:
+            spark.stop()
     return 0
 
 
