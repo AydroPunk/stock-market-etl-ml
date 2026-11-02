@@ -40,16 +40,24 @@ def _a_texto(col_name: str, tipo, formato: str):
 
 
 def _leer_parquets(spark, carpeta: Path) -> list[DataFrame]:
-    """Un DataFrame por archivo: no todos los parquet traen los mismos tipos."""
+    """Un DataFrame por grupo de archivos con el mismo esquema.
+
+    No todos los parquet guardan igual las fechas (nanosegundos o milisegundos)
+    ni el volumen (entero o decimal), y Spark no puede leerlos juntos si los
+    tipos no coinciden. Se agrupan por esquema y cada grupo se lee de una vez.
+    """
     import pyarrow.parquet as pq
 
-    frames = []
+    grupos: dict[str, list[str]] = {}
     for path in sorted(carpeta.glob("*.parquet")):
-        if pq.read_metadata(path).num_rows == 0:  # leer el pie del archivo es instantáneo
+        meta = pq.read_metadata(path)  # leer el pie del archivo es instantáneo
+        if meta.num_rows == 0:
             print(f"  ! {path.name} vacío, se omite")
             continue
-        frames.append(spark.read.parquet(str(path)).withColumn("ticker", ticker_de_archivo()))
-    return frames
+        firma = str(meta.schema.to_arrow_schema().remove_metadata())
+        grupos.setdefault(firma, []).append(str(path))
+    return [spark.read.parquet(*rutas).withColumn("ticker", ticker_de_archivo())
+            for rutas in grupos.values()]
 
 
 def bronze_market(spark) -> DataFrame:

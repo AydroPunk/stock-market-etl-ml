@@ -8,7 +8,7 @@
 
 version: "2.1"
 dominio: "Mercado"
-equipo_responsable: "Equipo Mercado (Precios & FX), equipo verde"
+equipo_responsable: "Equipo Mercado (Precios & FX)"
 fuente_datos: "Yahoo Finance (diario) y DataBursátil (intradía 5 min)"
 base: "SQLite data/market/gold/mercado.db (solo lectura)"
 actualizacion: "Cada vez que se corre el ETL de src/etl (bronze → silver → gold) después de refrescar data/market"

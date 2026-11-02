@@ -1,4 +1,4 @@
-"""Piezas comunes del ETL PySpark de Precios & FX (equipo verde).
+"""Piezas comunes del ETL PySpark de Precios & FX (Equipo Mercado).
 
 Lo usan src/etl/bronze/mercado, src/etl/silver/mercado y src/etl/gold/mercado:
 rutas, esquemas de cada capa, la sesión de Spark, la escritura de un CSV por
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import warnings
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -24,12 +25,6 @@ MAX_DIAS_FX = 5  # si falta el tipo de cambio, el último conocido hasta 5 días
 BARRAS_DIA = 79  # 6.5 h de sesión / 5 min + 1
 UMBRAL_FALLA = 0.8  # % de emisoras con un solo precio el mismo día = falla de la fuente
 DECIMALES = 10
-
-COMANDOS = (
-    "python -m src.etl.bronze.mercado.etl_bronze && "
-    "python -m src.etl.silver.mercado.etl_silver && "
-    "python -m src.etl.gold.mercado.etl_gold"
-)
 
 # ── esquemas: una sola fuente de verdad para Spark, CSV, diccionario y SQLite ─
 
@@ -146,6 +141,11 @@ def esquema_spark(capa: str):
 def crear_spark(nombre: str):
     from pyspark.sql import SparkSession
 
+    # PySpark avisa que no está probado con pandas >= 3. Aquí pandas solo arma la
+    # base SQLite y las muestras del diccionario, y los resultados se validaron:
+    # se silencia solo ese aviso para que se lea la salida del ETL.
+    warnings.filterwarnings("ignore", message="PySpark does not yet fully support pandas",
+                            category=FutureWarning)
     spark = (
         SparkSession.builder.master("local[*]").appName(nombre)
         # las fechas se guardan sin zona horaria: UTC evita que Spark las mueva
@@ -155,6 +155,10 @@ def crear_spark(nombre: str):
         .config("spark.sql.shuffle.partitions", "8")
         .config("spark.ui.enabled", "false")
         .config("spark.ui.showConsoleProgress", "false")
+        # Arrow pasa los datos de Spark a pandas por bloques de columnas (más rápido);
+        # si en alguna compu no funciona, Spark regresa solo al método anterior.
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("ERROR")

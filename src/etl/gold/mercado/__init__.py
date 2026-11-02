@@ -1,1 +1,1 @@
-"""Capa gold del equipo Mercado (Precios & FX)."""
+"""Capa gold del Equipo Mercado (Precios & FX)."""

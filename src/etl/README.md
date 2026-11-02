@@ -10,7 +10,7 @@ src/etl/
 └── shared/            piezas comunes
 ```
 
-## Equipo mercado (Precios & FX)
+## Equipo Mercado (Precios & FX)
 
 | Capa   | Script                         | Lee                                                | Escribe                                                        |
 |--------|--------------------------------|----------------------------------------------------|----------------------------------------------------------------|
@@ -26,7 +26,7 @@ python -m src.etl.silver.mercado.etl_silver
 python -m src.etl.gold.mercado.etl_gold
 ```
 
-Necesitan Java 17 o 21 y `pyspark`. Los esquemas de cada capa están en `shared/precios_fx.py` (`ESQUEMA`) y en el
+Necesitan 21 y `pyspark`. Los esquemas de cada capa están en `shared/precios_fx.py` (`ESQUEMA`) y en el
 `_diccionario.md` de cada carpeta de datos. Detalle del producto: `productos/precios_fx/README.md`.
 
 Los demás archivos de esta carpeta (`alsea/`, `walmex/`, `cargar_precios.py`, `shared/extractors`, `shared/loaders`...)

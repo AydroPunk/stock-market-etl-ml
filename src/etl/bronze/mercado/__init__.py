@@ -1,1 +1,1 @@
-"""Capa bronze del equipo Mercado (Precios & FX)."""
+"""Capa bronze del Equipo Mercado (Precios & FX)."""

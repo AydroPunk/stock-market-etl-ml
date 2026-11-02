@@ -72,7 +72,7 @@ temp/
 tmp/
 backfill.pid
 
-# Capas del producto Precios & FX: se regeneran con python productos/precios_fx/capas.py
+# Capas del producto Precios & FX: se regeneran con el ETL de src/etl (bronze → silver → gold)
 data/market/bronze/*
 data/market/silver/*
 data/market/gold/*

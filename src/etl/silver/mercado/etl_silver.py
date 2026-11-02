@@ -28,6 +28,18 @@ from src.etl.shared.precios_fx import (
 SCRIPT = "src.etl.silver.mercado.etl_silver"
 
 
+def _sin_duplicados(df: DataFrame, llave: list[str]) -> DataFrame:
+    """Si una llave se repite, se queda la última fila del archivo (la más reciente).
+
+    Spark con dropDuplicates escoge cualquiera; así el resultado es siempre el mismo.
+    _orden es la posición de la fila al leerla.
+    """
+    w = Window.partitionBy(*llave).orderBy(F.col("_orden").desc())
+    return (df.withColumn("_n", F.row_number().over(w))
+            .filter("_n = 1")
+            .drop("_n", "_orden"))
+
+
 def silver_market(bronze: DataFrame) -> DataFrame:
     df = (
         bronze.select(
@@ -38,9 +50,10 @@ def silver_market(bronze: DataFrame) -> DataFrame:
             F.col("Low").alias("low"),
             F.col("Close").alias("close"),
             F.coalesce(F.col("Volume"), F.lit(0)).cast("long").alias("volume"),
+            F.monotonically_increasing_id().alias("_orden"),
         )
-        .dropDuplicates(["ticker", "fecha"])
     )
+    df = _sin_duplicados(df, ["ticker", "fecha"])
     w = Window.partitionBy("ticker").orderBy("fecha")
     prev = F.lag("close").over(w)
     es_mxn = F.col("ticker").endswith(".MX") | (F.col("ticker") == FX)
@@ -81,8 +94,11 @@ def silver_intraday(bronze: DataFrame, dias: DataFrame) -> DataFrame:
             "ticker",
             F.col("datetime").alias("fecha_hora"),
             F.col("price").alias("precio"),
+            F.monotonically_increasing_id().alias("_orden"),
         )
-        .dropDuplicates(["ticker", "fecha_hora"])
+    )
+    df = (
+        _sin_duplicados(df, ["ticker", "fecha_hora"])
         .withColumn("fecha", F.substring("fecha_hora", 1, 10))
     )
     w_dia = Window.partitionBy("ticker", "fecha")

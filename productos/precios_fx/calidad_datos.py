@@ -1,4 +1,4 @@
-"""Producto de datos Precios & FX: completitud y calidad (equipo verde).
+"""Producto de datos Precios & FX: completitud y calidad (Equipo Mercado).
 
 Lee lo que ya está en data/ y genera gráficas + tablas en
 productos/precios_fx/salida/. No descarga nada.

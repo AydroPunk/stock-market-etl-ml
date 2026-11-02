@@ -1,11 +1,11 @@
-# Producto Precios & FX (equipo verde)
+# Producto Precios & FX (Equipo Mercado)
 
 OHLCV diario, tipo de cambio USD/MXN e intradía de 5 minutos, en capas bronze → silver → gold con PySpark, más la
 herramienta `consultar_mercado_sql` para que el agente consulte el gold.
 
 ## Cómo correrlo
 
-Requisitos: Java 17 o 21 (`sudo dnf install java-21-openjdk-headless` en Fedora) y
+Requisitos: Java 21 (`sudo dnf install java-21-openjdk-headless` en Fedora) y
 `uv pip install pyspark pyarrow pandas sqlglot pyyaml`.
 
 ```bash
