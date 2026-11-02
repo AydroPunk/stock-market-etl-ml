@@ -61,12 +61,12 @@ yfinance>=0.2.28           # Yahoo Finance API
 psycopg[binary]>=3.2.0     # Cloud SQL Postgres, esquema lab
 pyarrow>=14.0.0            # Lectura de los .parquet de data/
 sqlglot>=25.0.0            # Validación de SQL en consultar_mercado_sql
-pyspark>=4.0.0             # ETL bronze/silver/gold de src/etl (necesita 21 o superior)
+pyspark>=4.0.0             # ETL bronze/silver/gold de src/etl (necesita Java 17 o 21)
 lightgbm>=4.0.0            # Gradient boosting (xs_lgbm, ensemble, eval A/B)
 py7zr>=1.0.0               # Descompresión de hechos BMV (/v2/descargas)
 
 # Google AI (mismo patrón que TrabajadoresDomesticos — API key directa, sin Vertex AI)
-google-genai>=2.0.0        # Gemini 3.8-flash para análisis de sentimiento de noticias
+google-genai>=2.0.0        # Gemini 2.5-flash para análisis de sentimiento de noticias
 
 # Literature / knowledge base
 pypdf>=4.0.0               # PDF text extraction for articles/knowledge/
