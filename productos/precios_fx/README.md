@@ -40,10 +40,11 @@ y la última no tiene `target_next_5m`.
 
 Silver no borra ni corrige filas: las marca. Gold diario calcula sobre todas y deja `es_valido` para filtrar. Gold
 intradía deja fuera las barras de relleno: días festivos y días en que la fuente mandó un solo precio para casi todas
-las emisoras (2025-02-12, 2025-04-16, 2026-06-29 y 2026-06-30).
+las emisoras. Con los datos actuales son 46: 2025-02-12, 2025-04-16, 2026-06-29, 2026-06-30 y tres rachas en 2026 (12 al
+31 de agosto, 21 al 30 de septiembre y 5 al 30 de octubre). Silver los lista cada vez que corre.
 
 `data/market/gold/mercado.db` (SQLite) tiene tres tablas: `precios_historicos` (gold diario de todos los símbolos),
-`tipo_cambio` e `intradia_diario`. Las barras de 5 minutos no entran a la base (1.1 millones de filas que el agente no
+`tipo_cambio` e `intradia_diario`. Las barras de 5 minutos no entran a la base (1.2 millones de filas que el agente no
 necesita); ML las lee de `data/intraday/gold/`. La describe `semantic_layer_mercado.yaml`, en la raíz del repo.
 
 Los CSV y la base se regeneran con el ETL y están en `.gitignore`; solo se suben los `_diccionario.md`.

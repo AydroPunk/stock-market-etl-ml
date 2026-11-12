@@ -467,5 +467,8 @@ def construir_db(precios: pd.DataFrame, intradia_diario: pd.DataFrame | None,
         if intradia_diario is not None:
             intradia_diario.to_sql("intradia_diario", conn, if_exists="append", index=False)
         conn.execute("CREATE INDEX idx_precios_fecha ON precios_historicos (fecha)")
+    # El "with" de sqlite3 guarda los cambios pero no cierra la conexión, y Windows no deja
+    # reemplazar un archivo abierto (PermissionError WinError 32): se cierra antes del replace.
+    conn.close()
     tmp.replace(db_path)
     return db_path
