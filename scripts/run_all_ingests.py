@@ -6,6 +6,7 @@ Ejecuta en secuencia todas las fuentes que alimentan SuperModel:
   2. Noticias          (todos los universos → data/news/)
   3. Intradía 5m        (DataBursátil → data/intraday/)
   4. Fundamentales      (DataBursátil → data/fundamentals.parquet)
+     + Fundamentales PIT (Equipo Rojo: bronze → silver → golden en data/fundamentals/)
   5. SQL ETL incremental (opcional → MercadoBursatil)
   6. Auditoría          (scripts/audit_data.py → data/ingest/last_run.json)
 
@@ -136,6 +137,39 @@ def ingest_fundamentals(max_age_days: int = 7, force: bool = False) -> dict[str,
     return {"rows": rows, "path": str(FUNDAMENTALS_PATH)}
 
 
+def ingest_fundamentales_pit(force: bool = False) -> dict[str, Any]:
+    """Producto Fundamentales PIT (Equipo Rojo): bronze incremental -> silver -> golden.
+
+    Cada corrida solo le pide a la API lo que falta (trimestres nuevos o que aún no
+    estaban publicados), así que correrlo a diario es barato. Necesita el bronze
+    local (data/fundamentals/bronze): sin él haría un backfill completo (~1,400
+    llamadas), por eso en un entorno nuevo se omite salvo --force-fundamentals.
+    """
+    import os
+
+    if not os.environ.get("DATABURSATIL_API_TOKEN"):
+        return {"skipped": True, "reason": "sin DATABURSATIL_API_TOKEN"}
+    from productos.fundamentales_pit import capas
+    from productos.fundamentales_pit.pit import GOLDEN
+
+    if not force and not any(capas.BRONZE.glob("*/*/*.json")):
+        return {"skipped": True, "reason": "sin bronze local; corre una vez "
+                "`python -m productos.fundamentales_pit.capas todo --bronze` o usa --force-fundamentals"}
+    try:
+        capas.main(["todo", "--bronze"])
+    except SystemExit as exc:   # capas.main termina con SystemExit si falta el token
+        raise RuntimeError(f"fundamentales_pit: {exc}") from exc
+
+    import pandas as pd
+
+    golden = pd.read_parquet(GOLDEN)
+    return {
+        "rows": len(golden),
+        "ultimo_quarter_end": str(pd.to_datetime(golden["quarter_end"]).max().date()),
+        "path": str(GOLDEN),
+    }
+
+
 def ingest_sql_etl() -> dict[str, Any]:
     from src.utils.config import Config
 
@@ -172,6 +206,47 @@ def ingest_audit() -> dict[str, Any]:
     }
 
 
+def ingest_tasas_hoy() -> dict[str, Any]:
+    """Guarda snapshot de tasas de mercado de dinero (TIIE, CETE, Tasa_Objetivo)."""
+    from src.ml.rates_features import fetch_tasas_snapshot
+    snap = fetch_tasas_snapshot(sleep=0)
+    if snap:
+        return {"ok": True, "n_tasas": len(snap), "tiie28": snap.get("tiie28"), "tasa_obj": snap.get("tasa_obj")}
+    return {"ok": False}
+
+
+def ingest_hechos_hoy() -> dict[str, Any]:
+    """Descarga los hechos (order flow) del día hábil anterior."""
+    import subprocess
+    from datetime import date, timedelta
+    ayer = date.today() - timedelta(days=1)
+    fecha = ayer.strftime("%Y-%m-%d")
+    r = subprocess.run(
+        [str(ROOT / "venv" / "bin" / "python"), "scripts/backfill_hechos.py",
+         "--fecha", fecha, "--sleep", "0"],
+        cwd=str(ROOT), capture_output=True, text=True,
+    )
+    return {"fecha": fecha, "ok": r.returncode == 0, "output": r.stdout.strip()[-200:]}
+
+
+def ingest_record_signals() -> dict[str, Any]:
+    """Corre SuperModel (--fast, sin Gemini) y guarda señales timestamped."""
+    import subprocess
+    r = subprocess.run(
+        [str(ROOT / "venv" / "bin" / "python"), "scripts/record_signals.py", "--no-gemini"],
+        cwd=str(ROOT), capture_output=True, text=True,
+    )
+    # Extraer n_bets del output
+    n_bets = 0
+    for line in r.stdout.splitlines():
+        if "Apuestas:" in line:
+            try:
+                n_bets = int(line.split(":")[-1].strip())
+            except ValueError:
+                pass
+    return {"ok": r.returncode == 0, "n_bets": n_bets, "output": r.stdout.strip()[-300:]}
+
+
 def run_ingests(
     *,
     ohlcv: bool = False,
@@ -180,6 +255,8 @@ def run_ingests(
     fundamentals: bool = False,
     sql: bool = False,
     audit: bool = True,
+    hechos: bool = True,
+    record_signals: bool = True,
     all_steps: bool = False,
     groups: tuple[str, ...] = DEFAULT_OHLCV_GROUPS,
     news_days: int = 7,
@@ -217,8 +294,17 @@ def run_ingests(
                 force=force_fundamentals,
             ),
         ))
+        steps.append((
+            "fundamentales_pit",
+            lambda: ingest_fundamentales_pit(force=force_fundamentals),
+        ))
     if sql:
         steps.append(("sql_etl", ingest_sql_etl))
+    steps.append(("tasas_hoy", ingest_tasas_hoy))
+    if hechos:
+        steps.append(("hechos_hoy", ingest_hechos_hoy))
+    if record_signals:
+        steps.append(("record_signals", ingest_record_signals))
     if audit:
         steps.append(("audit", ingest_audit))
 
@@ -267,6 +353,8 @@ def main() -> None:
     parser.add_argument("--sql", action="store_true", help="ETL incremental → SQL Server")
     parser.add_argument("--skip-sql", action="store_true", help="Con --all: no ejecutar SQL ETL")
     parser.add_argument("--skip-audit", action="store_true", help="No correr auditoría al final")
+    parser.add_argument("--skip-hechos", action="store_true", help="No descargar hechos del día")
+    parser.add_argument("--skip-signals", action="store_true", help="No registrar señales del día")
     parser.add_argument(
         "--groups", nargs="+", default=list(DEFAULT_OHLCV_GROUPS),
         choices=list(DEFAULT_OHLCV_GROUPS),
@@ -287,6 +375,8 @@ def main() -> None:
         fundamentals=args.all or args.fundamentals,
         sql=args.sql or (args.all and not args.skip_sql),
         audit=not args.skip_audit,
+        hechos=not args.skip_hechos,
+        record_signals=not args.skip_signals,
         groups=tuple(args.groups),
         news_days=args.news_days,
         news_universe="bmv" if args.news_bmv_only else None,

@@ -7,7 +7,7 @@ domesticospro:us-central1:domesticos-pg, database mercado, esquema lab.
 
 Cadena:
   ingest (lun-vie 18:30, y sáb-dom solo noticias)
-    escribe lab.price_daily y lab.news_daily.
+    escribe lab.price_daily, lab.news_daily y lab.news_feature_daily.
   decide (lun-vie 19:15)
     arma el plan de entrada del siguiente día hábil.
   score (lun-vie 20:00)
@@ -18,6 +18,10 @@ Escritura (src/db/lab_store.py, esquema de sql/03_lab_schema.sql):
       ticker, trade_date, open, high, low, close, volume, moneda, source
   insert_news → lab.news_daily
       ticker, trade_date, title, source, sentiment, url
+  upsert_news_features → lab.news_feature_daily
+      ticker, trade_date, universe, news_sent_score, news_count_7d,
+      news_sent_delta, news_sent_vol, news_relevance_avg, news_esg_score,
+      n_articles, sources
   insert_decision(session_date, model, cash_usd, motivo, raw, plans)
       lab.decision + lab.entry_plan
       (ticker, usd, horizon texto "20d"/"4s", stop_usd, p_sube, enter_on)
@@ -310,6 +314,23 @@ def _write_news(rows: list[dict]) -> int | None:
     return int(fn(rows))
 
 
+def _write_news_features(rows: list[dict]) -> int | None:
+    """lab_store.upsert_news_features → lab.news_feature_daily.
+
+    Campos: ticker, trade_date, universe, news_sent_score, news_count_7d,
+            news_sent_delta, news_sent_vol, news_relevance_avg, news_esg_score,
+            n_articles, sources.
+    """
+    store = _import_lab_store()
+    if not _db_ready(store):
+        logger.info("features de noticias sin Postgres (%d filas)", len(rows))
+        return None
+    fn = getattr(store, "upsert_news_features", None)
+    if not callable(fn):
+        raise RuntimeError("lab_store no define upsert_news_features")
+    return int(fn(rows))
+
+
 def _plans_for_store(plans: list[dict]) -> list[dict]:
     stored = []
     for row in plans:
@@ -345,6 +366,7 @@ def _write_decision(decision: dict, plans: list[dict]) -> int | None:
             "enter_on": decision.get("enter_on"),
             "book": decision.get("book"),
             "plans": plan_rows,
+            **{k: decision[k] for k in ("regla", "gemelo", "vetos", "candidatos", "tendencia") if k in decision},
         },
         plans=plan_rows,
     ))
@@ -678,50 +700,80 @@ def _rows_from_articles(session: date) -> list[dict]:
     return rows
 
 
-def _rows_from_feature_cache(session: date) -> list[dict]:
-    """Si el scrape no dejó artículos, una fila por ticker desde el cache de features."""
+def _fetch_news_feature_rows(session: date) -> list[dict]:
+    """Obtiene filas de features de noticias por ticker para lab.news_feature_daily.
+
+    Grano: una fila por ticker × trade_date.
+    Prioriza el cache fechado del día, luego latest.json si es la sesión de hoy,
+    o corre fetch_news para calcular las features de la ventana.
+    """
     path = ROOT / "data" / "news" / f"{session.isoformat()}.json"
+    if not path.exists():
+        latest = ROOT / "data" / "news" / "latest.json"
+        if latest.exists() and session == _today_mx():
+            path = latest
     if not path.exists():
         try:
             from scripts.fetch_news import run_fetch_news
 
-            result = run_fetch_news(days_back=2, universe=None, gdelt=False, save_cache=True, verbose=False)
+            result = run_fetch_news(days_back=7, universe=None, gdelt=False, save_cache=True, verbose=False)
             dated = (result.get("paths") or {}).get("dated")
             if dated:
                 path = Path(dated)
+            elif (result.get("paths") or {}).get("latest"):
+                path = Path(result["paths"]["latest"])
         except Exception as exc:
             logger.warning("scripts/fetch_news.py no corrió: %s", _redact(str(exc)))
             return []
     if not path.exists():
         return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("no se pudo leer cache de features %s: %s", path, _redact(str(exc)))
+        return []
+
     if isinstance(payload, dict):
         payload = payload.get("records") or payload.get("rows") or []
+    if not isinstance(payload, list):
+        return []
+
+    index = _universe_index()
     rows = []
     for rec in payload:
+        if not isinstance(rec, dict):
+            continue
         ticker = rec.get("ticker")
         if not ticker:
             continue
+        meta = index.get(str(ticker).upper(), {})
+        universe = rec.get("universe") or meta.get("slug")
         sources = rec.get("sources")
-        if isinstance(sources, list):
-            sources = ",".join(str(item) for item in sources)
+        if isinstance(sources, (list, tuple, set)):
+            sources = ",".join(str(item) for item in sorted(sources))
+        elif sources is not None:
+            sources = str(sources)
+
         rows.append({
-            "ticker": ticker,
+            "ticker": str(ticker).upper(),
             "trade_date": session,
-            "title": None,
-            "source": sources,
-            "sentiment": _num(rec.get("news_sent_score")),
-            "url": None,
+            "universe": universe,
+            "news_sent_score": _num(rec.get("news_sent_score", 0.0)),
+            "news_count_7d": _num(rec.get("news_count_7d", 0.0)),
+            "news_sent_delta": _num(rec.get("news_sent_delta", 0.0)),
+            "news_sent_vol": _num(rec.get("news_sent_vol", 0.0)),
+            "news_relevance_avg": _num(rec.get("news_relevance_avg", 0.0)),
+            "news_esg_score": _num(rec.get("news_esg_score", 0.0)),
+            "n_articles": int(rec.get("n_articles") or 0),
+            "sources": sources,
         })
     return rows
 
 
 def _fetch_news_rows(session: date) -> list[dict]:
-    rows = _rows_from_articles(session)
-    if rows:
-        return rows
-    logger.info("sin artículos del día; uso el cache de features si existe")
-    return _rows_from_feature_cache(session)
+    """Artículos individuales para lab.news_daily."""
+    return _rows_from_articles(session)
 
 
 def run_ingest(session: date | None = None) -> int:
@@ -739,8 +791,13 @@ def run_ingest(session: date | None = None) -> int:
     news = _fetch_news_rows(session)
     written_news = _write_news(news)
     logger.info("noticias %d (postgres=%s)", len(news), written_news)
-    if weekend and not news:
-        logger.error("fin de semana sin noticias")
+
+    news_features = _fetch_news_feature_rows(session)
+    written_features = _write_news_features(news_features)
+    logger.info("features noticias %d (postgres=%s)", len(news_features), written_features)
+
+    if weekend and not news and not news_features:
+        logger.error("fin de semana sin noticias ni features")
         return 1
     _emit({
         "mode": "ingest",
@@ -748,6 +805,7 @@ def run_ingest(session: date | None = None) -> int:
         "weekend": weekend,
         "prices": len(prices),
         "news": len(news),
+        "news_features": len(news_features),
     })
     return 0
 
@@ -918,7 +976,7 @@ def _call_llm(context: dict) -> tuple[dict, str] | None:
         },
         json={
             "model": model,
-            "max_tokens": 800,
+            "max_tokens": 2000,
             "system": "Eres el agente inversor. Respondes únicamente JSON.",
             "messages": [{"role": "user", "content": user}],
         },
@@ -967,6 +1025,42 @@ def _attach_p_sube(rows: list[dict], limit: int = 8) -> None:
     for row in rows[:limit]:
         if row.get("p_sube") is None and row.get("symbol"):
             row["p_sube"] = _p_sube(row["symbol"])
+
+
+def _plan_from_agent(book, enter_on: date):
+    """Claude elige tools (modelos, IV, horizontes) y cierra con la asignación."""
+    from src.agent.book import Book
+    from src.agent.investor import AgenteInversor
+
+    agent_book = book if book is not None else Book()
+    result = AgenteInversor(agent_book).act(apply=False)
+    if not result.get("ok"):
+        logger.warning("agente con tools no cerró: %s", result.get("error"))
+        return None
+    asig = result.get("asignacion") or {}
+    index = _universe_index()
+    fx = _fx_close(enter_on) or _fx_close(_today_mx())
+    rows = []
+    for alloc in asig.get("allocations") or []:
+        ticker = str(alloc.get("ticker") or "").upper()
+        meta = index.get(ticker)
+        if meta is None:
+            continue
+        quote = _quote(meta, enter_on, fx) or _quote(meta, _today_mx(), fx)
+        if quote is None:
+            continue
+        days = HORIZON_BDAYS.get(str(alloc.get("horizon") or ""), meta["horizon_days"])
+        rows.append({
+            "ticker": ticker,
+            "symbol": meta["symbol"],
+            "usd": round(float(alloc["usd"]), 2),
+            "stop": quote["stop"],
+            "p_sube": None,
+            "enter_on": enter_on.isoformat(),
+            "horizon_days": days,
+            "entry_px": quote["entry_px"],
+        })
+    return rows, asig.get("motivo") or "tools", float(asig.get("cash_usd") or 0), result.get("modelo")
 
 
 def _plan_from_llm(book, candidates: list[dict], enter_on: date) -> tuple[list[dict], str, float, str] | None:
@@ -1096,6 +1190,90 @@ def _plan_from_rules(book, candidates: list[dict], enter_on: date) -> tuple[list
     return rows, motivo, cash
 
 
+def _cs_frames(session: date) -> dict[str, pd.DataFrame]:
+    """Unos 15 meses de barras del núcleo, el satélite y MXN=X: parquet local,
+    y lo que falte (en Cloud Run, todo) de yfinance en lotes."""
+    from src.agent import core_satellite as cs
+
+    start = session - timedelta(days=460)
+    wanted = {name: cs.symbol_of(name) for name in cs.CORE}
+    wanted.update(cs.satellite_symbols())
+    wanted[cs.FX_SYMBOL] = cs.FX_SYMBOL
+    frames: dict[str, pd.DataFrame] = {}
+    missing: dict[str, str] = {}
+    for name, symbol in wanted.items():
+        frame = _history(symbol, start, session) if _market_path(symbol).exists() else pd.DataFrame()
+        if frame.empty:
+            missing[name] = symbol
+        else:
+            frames[name] = _ohlc_frame(frame)
+    symbols = list(missing.values())
+    for offset in range(0, len(symbols), 40):
+        batch = symbols[offset : offset + 40]
+        try:
+            raw = _yf_download(batch, start, session)
+        except Exception as exc:
+            logger.warning("yfinance falló (%d símbolos): %s", len(batch), _redact(str(exc)))
+            continue
+        for name, symbol in missing.items():
+            if symbol not in batch:
+                continue
+            frame = _ohlc_frame(_slice_symbol(raw, symbol, len(batch) > 1)).dropna(how="all")
+            if frame.empty or "Close" not in frame.columns:
+                continue
+            idx = pd.to_datetime(frame.index)
+            frame.index = idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
+            frames[name] = frame.sort_index()
+    return frames
+
+
+def _plan_from_core_satellite(book, session: date, enter_on: date) -> tuple[list[dict], str, float, str | None, dict]:
+    """La regla pone los pesos; Haiku solo puede vetar nombres del satélite.
+    El gemelo sin veto queda en raw para medir lo que aporta el LLM."""
+    from src.agent import core_satellite as cs
+
+    budget = _policy()[0]
+    frames = _cs_frames(session)
+    if "SPY" not in frames or cs.FX_SYMBOL not in frames:
+        raise RuntimeError("sin historia de SPY o MXN=X para la regla")
+    asof = pd.Timestamp(session)
+    inputs = cs.Inputs.load()
+    held = [t for t in (book.positions if book is not None else {}) if t not in cs.CORE]
+    twin = cs.decide(frames, asof, inputs, equity_usd=budget, held_satellite=held)
+    decision, model = twin, None
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        from src.agent.veto import llm_veto
+
+        decision = cs.decide(frames, asof, inputs, equity_usd=budget, held_satellite=held, veto=llm_veto)
+        model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-5-5")
+    fx = cs.fx_on(frames, asof)
+    rows = []
+    for name, weight in decision.weights.items():
+        symbol = cs.symbol_of(name)
+        close = float(frames[name]["Close"].loc[:asof].dropna().iloc[-1])
+        px = close / fx if cs.is_mx(symbol) else close
+        stop = None if name in cs.CORE else round(px * (1 - cs.CATASTROPHE_DD), 4)
+        rows.append({
+            "ticker": name,
+            "symbol": symbol,
+            "usd": round(weight * budget, 2),
+            "stop": stop,
+            "p_sube": None,
+            "enter_on": enter_on.isoformat(),
+            "horizon_days": HORIZON_BDAYS["4s"],
+            "entry_px": round(px, 4),
+        })
+    cash = round(budget - sum(r["usd"] for r in rows), 2)
+    extra = {
+        "regla": cs.config(),
+        "gemelo": twin.weights,
+        "vetos": decision.vetoed,
+        "candidatos": decision.candidates,
+        "tendencia": decision.trend,
+    }
+    return rows, decision.motivo, cash, model, extra
+
+
 def _public_plan(row: dict) -> dict:
     return {
         "ticker": row["ticker"],
@@ -1106,24 +1284,37 @@ def _public_plan(row: dict) -> dict:
     }
 
 
-def run_decide(session: date | None = None) -> int:
+def _horizontes(session: date) -> dict:
+    """Tres horizontes del libro de 50. Si falla, el decide sigue sin ellos."""
+    try:
+        from src.agent.horizons import libro
+        import pandas as pd
+        return {
+            "todo": libro(pd.Timestamp(session), "todo"),
+            "bmv": libro(pd.Timestamp(session), "bmv"),
+        }
+    except Exception as exc:
+        logger.warning("horizontes: %s", exc)
+        return {}
+
+
+def run_decide(session: date | None = None, force: bool = False) -> int:
+    """Una decisión al mes: al cierre de la última sesión, para la apertura siguiente.
+    Los demás días el libro no se toca."""
+    from src.agent.core_satellite import is_rebalance_day
+
     session = session or _today_mx()
     enter_on = _next_bday(session)
+    if not force and not is_rebalance_day(session, enter_on):
+        logger.info("decide: %s no es cierre de mes, el libro no se toca", session.isoformat())
+        return 0
     book = _load_book()
-    candidates = _with_open_positions(book, _candidates(session), session)
-    _attach_p_sube(candidates)
-    llm_used = False
-    model = None
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        built = _plan_from_llm(book, candidates, enter_on)
-    else:
-        logger.info("sin ANTHROPIC_API_KEY; no se llama al LLM")
-        built = None
-    if built is None:
-        plans, motivo, cash = _plan_from_rules(book, candidates, enter_on)
-    else:
-        plans, motivo, cash, model = built
-        llm_used = True
+    try:
+        plans, motivo, cash, model, extra = _plan_from_core_satellite(book, session, enter_on)
+    except Exception as exc:
+        logger.error("la regla núcleo/satélite falló: %s", _redact(str(exc)))
+        return 1
+    llm_used = model is not None
     decision = {
         "decided_on": session.isoformat(),
         "enter_on": enter_on.isoformat(),
@@ -1132,6 +1323,8 @@ def run_decide(session: date | None = None) -> int:
         "motivo": motivo,
         "cash_usd": cash,
         "book": None if book is None else book.snapshot(),
+        "horizontes": _horizontes(session),
+        **extra,
     }
     for row in plans:
         _emit(_public_plan(row))
@@ -1318,6 +1511,7 @@ def run_score(session: date | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Job diario Cloud Run del laboratorio mercado")
     parser.add_argument("--mode", required=True, choices=("ingest", "decide", "score"))
+    parser.add_argument("--force", action="store_true", help="decide aunque no sea cierre de mes")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
@@ -1329,7 +1523,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "ingest":
         return run_ingest()
     if args.mode == "decide":
-        return run_decide()
+        return run_decide(force=args.force)
     return run_score()
 
 
